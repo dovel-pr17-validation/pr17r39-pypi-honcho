@@ -1,0 +1,342 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+**Before opening a PR or filing an issue**, read [If you're an agent](CONTRIBUTING.md#if-youre-an-agent) in `CONTRIBUTING.md`. Pull requests are limited to maintainers (write access); everyone else files an issue. Issues follow [Filing an issue](CONTRIBUTING.md#filing-an-issue).
+
+# Honcho Overview
+
+## What is Honcho?
+
+Honcho is an infrastructure layer for building AI agents with memory and social cognition. Its primary purposes include:
+
+- Imbuing agents with a sense of identity
+- Personalizing user experiences through understanding user psychology
+- Providing a Chat Endpoint (the Dialectic agent) that injects personal context just-in-time
+- Supporting development of LLM-powered applications that adapt to end users
+- Enabling multi-peer sessions where multiple participants (users or agents) can interact
+
+Honcho leverages the inherent reasoning capabilities of LLMs to build coherent models of user psychology over time, enabling more personalized and effective AI interactions.
+
+## Core Concepts
+
+### Peer Paradigm
+
+Honcho uses a peer-based model where both users and agents are represented as "peers". This unified approach enables:
+
+- Multi-participant sessions with mixed human and AI agents
+- Configurable observation settings (which peers observe which others)
+- Flexible identity management for all participants
+
+### Key Primitives
+
+- **Workspace** (formerly App): The root organizational unit containing all resources
+- **Peer** (formerly User): Any participant in the system (human or AI)
+- **Session**: A conversation context that can involve multiple peers
+- **Message**: Data units that can represent communication between peers OR arbitrary data ingested by a peer to enhance its global representation
+- **Collections & Documents**: Internal vector storage for peer representations. Collections are keyed by `(observer, observed)` peer pairs. Collections/Documents are not directly exposed via API, but the observations stored within them are exposed as **Conclusions** (see `/v3/.../conclusions` endpoints).
+
+## Architecture Overview
+
+### API Structure
+
+All API routes follow the pattern: `/v3/{resource}/{id}/{action}`. Most "list/search" endpoints are `POST` so they can accept rich filter bodies.
+
+- **Workspaces**: Create, list, update, search
+- **Peers**: Create, list, update, chat (dialectic), messages, representation
+- **Sessions**: Create, list, update, delete, clone, manage peers, get context
+- **Messages**: Create (batch up to 100), upload (file), list, get, update
+- **Conclusions**: Create, list, query (semantic search), delete — the API-facing name for observations stored in `(observer, observed)` collections
+- **Keys**: Create scoped JWTs
+- **Tenants**: Create (idempotent), get, update (`PATCH`, `derivation_paused` only), delete — the above-tenant provisioning surface for control-plane use; authenticated by a service secret, not a JWT (see Tenant isolation)
+- **Webhooks**: Register endpoint, list, delete, test
+
+### Key Features
+
+#### Chat Endpoint (Dialectic agent) (`/peers/{peer_id}/chat`)
+
+- Provides bespoke responses informed by the representation
+- Integrates long-term facts from vector storage
+- Supports streaming responses
+- Configurable LLM providers
+
+#### Message Processing Pipeline
+
+1. Messages created via API (batch or single)
+2. Enqueued for background processing:
+   - `representation`: Update peer's context
+   - `summary`: Create session summaries
+3. Session-based queue processing ensures order
+4. Results stored internally in vector DB
+
+### Configuration
+
+- Hierarchical config: config.toml + environment variables
+- Database settings with connection pooling
+- Multiple LLM provider support
+- Background worker (deriver) settings
+- Authentication can be toggled on/off (`AUTH_USE_AUTH`); under `MULTI_TENANT` it must be on for API instances — the startup validator refuses the combination
+
+## Development Guide
+
+### Commands
+
+- Setup: `uv sync`
+- Run server: `uv run fastapi dev src/main.py`
+- Run tests: `uv run pytest tests/`
+- Run single test: `uv run pytest tests/path/to/test_file.py::test_function`
+- Reproduce an API bug (5xx, wrong status) as a property test: see the `property-repro` skill (`skills/property-repro/`)
+- Linting: `uv run ruff check src/`
+- Typechecking: `uv run basedpyright`
+- Format code: `uv run ruff format src/`
+
+### SDK Testing
+
+#### TypeScript SDK
+
+The TypeScript SDK tests run against a real Honcho server. `bun run test` (not bare `bun test`, which has no server to talk to) starts one for them: `scripts/run_ts_sdk_tests.py` creates a throwaway database on the Postgres named by `DB_CONNECTION_URI`, migrates it, starts the API and the mock LLM provider (`src/mock_provider`), runs `bun test`, and tears it all down. No provider key is needed. They are not part of `uv run pytest`.
+
+```bash
+cd sdks/typescript && bun run test             # whole suite
+cd sdks/typescript && bun run test peer.test   # bun test args pass through
+```
+
+**To type-check the TypeScript SDK (this is fine to run directly):**
+
+```bash
+cd sdks/typescript && bun run tsc --noEmit
+```
+
+### Code Style
+
+- Follow isort conventions with absolute imports preferred
+- Use explicit type hints with SQLAlchemy mapped_column annotations
+- snake_case for variables/functions; PascalCase for classes
+- Line length: 88 chars (Black compatible)
+- Explicit error handling with appropriate exception types
+- Docstrings: Use Google style docstrings
+- **Never hold a DB session during external calls** (LLM, embedding, HTTP). If a function needs both a DB session and an external call result, compute the external result first and pass it as a parameter. This avoids tying up DB connections during slow network I/O. Use `tracked_db` for short-lived, DB-only operations; pass a shared session when multiple DB-only calls can reuse one connection.
+- **Never write through a read-only session** (`tracked_db(..., read_only=True)`, `get_read_db`, `ReadSessionLocal`). These run in AUTOCOMMIT mode with no transaction: writes are NOT blocked by the database — they silently commit immediately, and `begin_nested()` savepoints break. There is no runtime guard; this is enforced by convention only. Use `read_only=True` strictly for SELECT-only windows; anything that mutates (including get-or-create paths) must use a regular write session.
+- **Tenant isolation (`MULTI_TENANT`, default off).** When enabled, every DB session carries a request-scoped `app.tenant` GUC so row-level-security policies scope reads and writes to a single tenant. `tracked_db` is then the per-tenant path and is fail-closed — it raises before any query if no tenant is in scope (a passed `tenant_id` or an ambient `tenant_context`). The same fail-closed rule holds where a tenant is read implicitly: the `tenant_id` column default (`models._default_tenant_id`) raises flag-on with no tenant bound rather than stamp `'default'`, the message-ingest advisory lock (`crud.message._ingest_lock`) is keyed on the bound tenant, and the deriver fails a representation work unit whose key carries no tenant prefix instead of reading its batch unscoped. `service_db` is the explicit RLS-bypass path for the legitimately cross-tenant work (the deriver's queue claim, the reconciler, the dreamer); never do per-tenant writes on it. For an HTTP request, the ambient `tenant_context` is bound once, in `require_auth` (`src/security.py`), from the tenant claim on the caller's JWT, and reset when the request completes — never do a per-tenant write outside a request without threading `tenant_id` explicitly. A startup validator (`src/startup/tenant_isolation_validator.py`) refuses to boot on half-states where isolation cannot hold (a transaction-mode pooler, RLS not enforced, no service role) or cannot serve (auth disabled on an API instance: with `AUTH_USE_AUTH` off every request is a tenant-less admin, no tenant is ever bound, and every `tracked_db` fails closed — an outage, not a leak; the deriver takes its tenant from the claimed work unit's key, so the deriver entrypoint skips that check). Off (the default, self-host), all of this is inert and honcho runs single-tenant on plain Postgres. `TENANT_ID` (flag-off only; boot is refused with it set flag-on) names that single tenant, as a name and not isolation: `models.instance_tenant_id()` is what the flag-off column default stamps and `scoped_tenant_id` filters on (`'default'` when unset), `telemetry.tenant.current_tenant_id()` reports it, and the migrations read it at migrate time — `e5fe7f8bcf62` backfills and seeds it, `0c67be41049b` writes it into `_queue_item_token_count`'s probe for tenant-less queue rows. It is fixed for the life of a database: the validator refuses to boot when the rows carry another tenant. Enforced by `tests/test_single_tenant_mode.py` (flag off with every subordinate setting — `DB_SERVICE_CONNECTION_URI`, `DB_POOLER_MODE`, `TENANT_API_SECRET` — set to a value flag-on would act on, nothing changes; add any new tenant-subordinate setting to `_SUBORDINATES` there) and `tests/startup/test_fresh_single_tenant_deploy.py` (empty database → `alembic upgrade head` → all three validators → first write and first claim, under the shipped defaults).
+- **Tenant registry (`/v3/tenants`).** A third auth plane sits above the two in the previous bullet: the registry provisions tenants before any JWT for that tenant can exist, so it cannot use `require_auth` at all — it is guarded by a constant-time-compared service secret (`TENANT_API_SECRET`), disabled by default and inert unless `MULTI_TENANT` is also on. That plane authenticates the caller as the control plane, never as a tenant, and the two planes are enforced never to mix on the same route. `vector_correlation_id` (the tenant's vector-store namespace key) is required on create, `min_length=1, max_length=128`, `RESOURCE_NAME_PATTERN` — a tenant registered without one must not be served under `MULTI_TENANT` (the namespace resolver, `src/vector_store/tenant_namespace.py`, fails closed rather than substitute a default), so a missing or malformed key is a 422 at the control plane's first allocation rather than a `NULL` discovered later. A `tenant_id` equal to a work-unit task type (`utils.work_unit.TASK_TYPES`) is also a 422: work-unit keys tell a tenant prefix from a task type by that set, so such a tenant could never enqueue work. Create never mutates a tenant (same id + different fields is a 409, which is what makes the control plane's provisioning retries safe); the one mutation door is `PATCH /v3/tenants/{id}`, whose allowlist is `schemas.TenantUpdate` (`extra="forbid"`) and has two entries with different semantics: `derivation_paused`, the control plane's mirrored "do not claim this tenant's billable work" bit, is fully mutable and idempotent, and `GET /v3/tenants?derivation_paused=true` lists the tenants that carry it; `vector_correlation_id` is set-once — a `NULL` row accepts a value, an equal value is a no-op, and a row that already holds a different value is a 409. Set-once is what keeps the resolver's process-lifetime memoization of the key safe without cross-process invalidation: it never caches a missing key (it refuses to serve instead), so the only transition the verb allows is one nothing has cached; the check runs under a row lock so two concurrent PATCHes cannot both see `NULL`. The deriver honours the bit in SQL, not in process state: `crud.deriver.not_paused_clause` is a `NOT EXISTS` against `tenants.derivation_paused` (served by the partial index `ix_tenants_derivation_paused`) that the claim, the in-unit fetches and the backlog metrics all apply, so a pause lands on the next claim or batch fetch with no staleness window, and KEDA's eligible count and the claim cannot disagree. It pauses only billable work: task types in `crud.deriver.PAUSE_EXEMPT_TASK_TYPES` (deletion, webhooks, scope maintenance, the tenant-less reconciler) keep running, and any new task type is paused until it is added there. Excluded units stay in the backlog (skipped, not drained) and are reported on their own gauges, per tenant. Like the previous bullet, all of this is inert with the flag off.
+- **Startup validators (`src/startup/`).** Both the API lifespan and the deriver entrypoint run them before serving traffic or claiming work, and each fails closed: `validate_embedding_schema` (pgvector column dims vs settings), `validate_tenant_isolation` (above), and `validate_queue_item_batches` — the deriver claim reads only the trigger-maintained `queue_item_batches` aggregate, so the process refuses to boot unless that table exists and its three `queue` triggers are present and enabled; otherwise enqueued work would be invisible to every deriver with no error anywhere.
+
+#### Multi-row locking and deadlocks
+
+Tables written concurrently by more than one worker — `documents` (deriver, dreamer, scope backfill/removal, reconciler), `queue` (every deriver replica), and `queue_item_batches` (trigger-maintained from every `queue` write, and claimed `FOR UPDATE SKIP LOCKED` by every deriver replica) — deadlock when two writers touch an overlapping row set in different orders. Rules:
+
+- **A multi-row `SELECT ... FOR UPDATE` MUST carry an explicit `ORDER BY <pk>`.** Without it Postgres locks in scan order, which differs per plan, so two writers with overlapping sets can cycle. `_apply_document_row_updates` in `src/crud/document.py` is the reference implementation.
+- **`WHERE id IN (...)` does NOT impose an order**, so sorting the Python list is a no-op — the list order is discarded and the planner picks `Bitmap Heap Scan` (ctid order), `Index Scan` (id order), or `Seq Scan` per invocation. Deterministic ordering requires either a preceding `SELECT ... ORDER BY id FOR UPDATE` or `WHERE id IN (SELECT id ... ORDER BY id FOR UPDATE)`.
+- **`Document.id` is a random nanoid** (`models.py`), so id order is uncorrelated with physical order — an unordered predicate `UPDATE`/`DELETE` is roughly a coin flip against an id-ordered locker per row pair, not a rare edge case. (`QueueItem.id` is an integer identity, so there id order is also chronological.)
+- **Prefer no lock at all.** A single `UPDATE ... WHERE <predicate>` acquires row locks as it writes and has no separate lock phase to get wrong. Reach for `FOR UPDATE` only when a value must be read, computed in Python, and written back — that read-modify-write is the only reason `_apply_document_row_updates` locks (it replaced a server-side `func.greatest()`), and `populate_existing=True` is required with it so the identity map doesn't serve a stale pre-lock value. Server-side expressions (`func.greatest`, the JSONB `-` operator) avoid the lock entirely; see `_clear_work_unit_retry_attempts` in `src/deriver/queue_manager.py`.
+- **Write `documents` before `collections`, and lock `collections` rows in sorted key order.** Every explicit-document insert bumps its collection's counters (`crud.collection.record_explicit_documents`, which updates in sorted `(tenant_id, workspace_name, observer, observed)` order), so a collection row is locked until the insert commits. Any transaction that touches several of one observer's collections (`process_scope_removal`, the scope backfill) must take its document locks first and then its collection locks in that same order, or it can deadlock against a concurrent insert.
+- `FOR UPDATE SKIP LOCKED` (the reconciler's claim pattern, and the deriver's own work-unit claim over `queue_item_batches` — `claim_rows_query` in `src/crud/deriver.py`) never waits, so it cannot be a deadlock partner for other SKIP LOCKED lockers — but it still locks in output order, its held locks can be the partner a blocking locker deadlocks against (the backlog triggers retry for exactly this), and holding those locks across an external call still stalls other writers. See the "never hold a DB session during external calls" rule above.
+
+#### Auth scoping
+
+- **Named-scope keys (`sc` plus `w`) require explicit `allow_scope=True` on supported routes.** This grants both recall and ingestion within that scope, not peer-member write access. Recall handlers must bind their projection to the token; session routes check active scope membership. Keep the named-scope route allowlist in `tests/routes/test_auth_route_policy.py` synchronized. Never allow restricted keys to enroll unrelated existing sessions or fall back to global recall.
+
+- **`allow_member_read=True` (in `require_auth(...)`) is read-only — NEVER set it on a route that mutates state.** It lets a peer-scoped key reach a session route when its peer is an active member of the session, so on a mutating route it would hand any session member write access (message injection, config mutation, deletion). HTTP method is not a reliable read/write signal here (some read routes use POST for a richer body), so this is enforced by an explicit allowlist in `tests/routes/test_auth_route_policy.py` — adding the flag to a new route fails that test until you consciously add the route to `EXPECTED_MEMBER_READ_ROUTES`, and you must never add a mutating method there.
+- **Under `MULTI_TENANT`, the tenant-claim check in `auth()` must run before the admin short-circuit.** An admin JWT (`ad: true`) is admin only within its own tenant; if the tenant gate moved after the admin check, a tenant-less admin token would bypass tenant scoping entirely.
+- **The tenant-registry API (`/v3/tenants`) uses `require_tenant_api`, never `require_auth`.** It is a separate, above-tenant auth plane authenticated by a service secret; a route must not carry both dependencies. Enforced by `test_tenant_api_routes_use_their_own_auth_plane` in `tests/routes/test_auth_route_policy.py`.
+- **When a member-read route is keyed by another sub-resource** (e.g. `peers/{peer_id}/config`), the handler must additionally confirm a peer-scoped caller only reads its OWN resource (`jwt_params.p == peer_id`, else raise `AuthenticationException`). Membership grants session access, not access to a co-member's data. See `get_peer_config` in `src/routers/sessions.py`.
+
+### Runtime Architecture
+
+Honcho runs as two cooperating processes that share a Postgres database and Redis cache:
+
+- **API server** (`uv run fastapi dev src/main.py`) — handles HTTP, enqueues background work, returns immediately. Hosts the **Dialectic** agent inline (synchronous tool loop during chat requests).
+  Every API replica runs `DeriverMetricsPoller` (`src/backlog.py`): the deriver/KEDA gauges every 30 s, and the dream-due check plus the `MessageEmbedding` backlog counts (`embeddings_pending`, `embeddings_pending_due`) every `DREAM_DUE_POLL_INTERVAL_SECONDS`, reusing the last counts in between. Under `DERIVER_SCHEDULER=api` every replica also enqueues the due dreams it finds; `enqueue_dream` dedupes on the work-unit key.
+- **Deriver worker** (`uv run python -m src.deriver`) — long-running queue consumer (uvloop). Runs the **Deriver**, **Summarizer**, and **Dreamer** off the queue. Can run multiple process replicas (a deployment concern, orthogonal to config); within one process, `DERIVER_WORKERS` (≤512) sets concurrent work-unit tasks, further capped by DB-pool headroom via `DERIVER_WORKERS_PER_POOL_CONNECTION` — when the pool is the binding cap, the process logs it at boot and exports `deriver_effective_worker_cap`. Also hosts an in-process **Reconciler scheduler** (`src/reconciler/`) that periodically embeds messages with `sync_state='pending'` in `MessageEmbedding` and cleans up stale queue items — embedding generation is decoupled from message creation by design.
+
+### Agent Architecture
+
+Honcho uses several specialized LLM agents. They share tool definitions and the LLM client abstraction in `src/utils/agent_tools.py` + `src/llm/`.
+
+> **Terminology:** what users see as **conclusions** (the public API surface and the term we use in documentation) is called **observations** in code symbols — `create_observations`, `delete_observations`, `get_observation_context`, etc. Doc prose below uses "conclusions"; references to actual code symbols stay as "observations."
+
+#### 1. Deriver (`src/deriver/`)
+
+**Role**: Memory formation through content ingestion.
+
+The Deriver processes batches of incoming messages and extracts conclusions about peers. The current architecture is "minimal deriver" — a **single LLM call** per batch using structured output, not an agentic tool loop. This trades flexibility for cost and predictability.
+
+- **Trigger**: Messages enqueued by `src/deriver/enqueue.py` on message create; consumed by `src/deriver/queue_manager.py` → `consumer.process_item()` → `deriver.process_representation_tasks_batch()`.
+- **Claim**: workers claim whole work units from `queue_item_batches` — a database-trigger-maintained aggregate (one row per pending unit: tenant, task type, token sum, oldest age) — via `FOR UPDATE SKIP LOCKED`, round-robin over `tenant_id` so no tenant starves another within a claim; a claimed unit is marked by an `ActiveQueueSession` row for the processing duration. Single-tenant deployments (every `tenant_id` NULL) get plain oldest-first ordering, unchanged.
+- **Output**: Explicit conclusions (direct facts) and deductive conclusions (inferences) saved to `(observer, observed)` collections.
+- **Entry point**: `src/deriver/__main__.py` → `queue_manager.main()`.
+- **Prompts**: `src/deriver/prompts.py` (`minimal_deriver_prompt`).
+- **Custom instructions**: per-workspace/peer guidance can be threaded into the prompt via reasoning configuration; `DERIVER__MAX_CUSTOM_INSTRUCTIONS_TOKENS` caps the addition (default 2000) and `DERIVER__MAX_INPUT_TOKENS` defaults to 25000 to make room.
+
+#### 2. Dialectic (`src/dialectic/`)
+
+**Role**: Analysis and recall for answering queries.
+
+The Dialectic answers questions about peers by strategically gathering context from memory. It is the only tool-using agent on the synchronous request path — it loops over `DIALECTIC_TOOLS` until it has enough context to answer. (The Dreamer specialists also use tools, but run off the queue.)
+
+- **Trigger**: API call to `POST /v3/.../peers/{peer_id}/chat`.
+- **Tools** (see `DIALECTIC_TOOLS` in `src/utils/agent_tools.py`): `search_memory`, `search_messages`, `get_observation_context`, `grep_messages`, `get_messages_by_date_range`, `search_messages_temporal`, `get_reasoning_chain`. At the `minimal` reasoning level, a reduced set (`DIALECTIC_TOOLS_MINIMAL`) is used: just `search_memory` + `search_messages`.
+- **Reasoning levels**: 5 tiers — `minimal`, `low`, `medium`, `high`, `max` — each with its own model config (see `DialecticLevelSettings` in `src/config.py`).
+- **Output**: Natural language response grounded in gathered context. Supports SSE streaming.
+- **Entry point**: `src/dialectic/chat.py` → `agentic_chat()` / `agentic_chat_stream()` → `DialecticAgent` (in `src/dialectic/core.py`).
+
+#### 3. Dreamer (`src/dreamer/`)
+
+**Role**: Consolidation and self-improvement of memory.
+
+The Dreamer is an orchestrated multi-specialist system that runs during scheduled "dreams" to consolidate conclusions and build reasoning trees.
+
+- **Trigger**: Scheduled via `DreamScheduler` (`src/dreamer/dream_scheduler.py`) or explicit dream task on the queue.
+- **Strategy**: Surprisal-based prioritization (`src/dreamer/surprisal.py`) selects which conclusions to expand. The orchestrator (`orchestrator.run_dream`) runs two specialist phases:
+  1. **DeductionSpecialist** (`specialists.py`) — produces deductive conclusions from explicit conclusions. Tools: `get_recent_observations`, `search_memory`, `search_messages`, `create_observations_deductive`, `delete_observations`, `update_peer_card`.
+  2. **InductionSpecialist** — produces inductive conclusions from explicit + deductive conclusions. Tools: same discovery set + `create_observations_inductive`, `update_peer_card`.
+- **Reasoning trees** (`src/dreamer/trees/`, migration `f1a2b3c4d5e6_add_reasoning_tree_columns`): each conclusion links to its premises and downstream conclusions, enabling `get_reasoning_chain` traversal at recall time.
+- **Output**: Deductive/inductive conclusions, consolidated redundancies, updated peer cards.
+- **Entry point**: `src/dreamer/orchestrator.py` → `process_dream()` (the package-level export from `src/dreamer/__init__.py`), which wraps `run_dream()`.
+
+#### 4. Summarizer (`src/utils/summarizer.py`)
+
+**Role**: Two-tier session summarization (direct LLM call — no agentic tools).
+
+- **Trigger**: Runs as part of the queue pipeline alongside representation tasks.
+- **Tiers**: short summary every `SUMMARY_MESSAGES_PER_SHORT_SUMMARY` messages (default 20); long summary every `SUMMARY_MESSAGES_PER_LONG_SUMMARY` (default 60). Token caps configurable via `SUMMARY_MAX_TOKENS_SHORT` / `SUMMARY_MAX_TOKENS_LONG`.
+
+#### Shared Agent Infrastructure
+
+- **Tool definitions** (`src/utils/agent_tools.py`): unified `TOOLS` dict; per-agent lists (`DIALECTIC_TOOLS`, `DIALECTIC_TOOLS_MINIMAL`, `DREAMER_TOOLS`, `DEDUCTION_SPECIALIST_TOOLS`, `INDUCTION_SPECIALIST_TOOLS`).
+- **LLM subsystem** (`src/llm/`): provider-agnostic `honcho_llm_call()`. Backends in `src/llm/backends/` (`anthropic.py`, `gemini.py`, `openai.py`). Includes prompt caching (`caching.py`), structured output (`structured_output.py`), tool loop (`tool_loop.py`), and a model registry. History is typed (`messages.py`: `SystemMessage`, `UserMessage`, `AIMessage`, `ToolMessage`); callers pass plain role/content dicts, and each attempt's codec (`codecs/`, resolved through `profiles.py`) renders the history for that attempt's provider. Per-retry provider selection is pinned via an `AttemptPlan` so stream-final retries don't bounce back to primary after the tool loop has settled on fallback.
+- **Per-agent model config**: each agent has its own `MODEL_CONFIG` in `src/config.py` with fallback chains (see `ConfiguredModelSettings`, `FallbackModelSettings`).
+- **Telemetry**: cloudevents in `src/telemetry/events/` cover API routes, dialectic, dream, deletion, reconciliation, representation, and per-call LLM accounting (`llm.py` — `LLMCallCompletedEvent` fires once per provider hit with full cost-attribution context). High-volume events are sampled deterministically per `run_id` via `TelemetrySettings.HIGH_VOLUME_SAMPLE_RATE`.
+- **Prometheus metrics** (`src/telemetry/prometheus/`): every metric carries a `namespace` label and every recorder is fail-soft (a metrics error never propagates into a request or a worker loop). Counter children with a *bounded* label domain are zero-initialized per process at startup — `initialize_bounded_metrics(instance_type=...)`, called from the `src/main.py` lifespan (`api`) and `src/deriver/__main__.py` (`deriver`) — so an absent series means a broken scrape rather than "nothing happened". Two consequences worth knowing before touching telemetry:
+  - **Adding a `BaseEvent` subclass requires adding its `_event_type` to `ALL_EVENT_TYPES`** in `src/telemetry/events/__init__.py` (and to `HIGH_VOLUME_EVENT_TYPES` if `_volume_class == "high_volume"`). Enforced by the drift guards in `tests/telemetry/test_metric_zero_init.py`, which assert set-equality against the discovered subclasses.
+  - **A service-wide, non-additive gauge must be refreshed by every replica that exports it, on its own timer**, and aggregated with `max()`/`avg()`, never `sum()`; a process with no writer must not zero-init it. `message_embeddings_pending` is the example: it reports a DB-global count, so it is set only by `DeriverMetricsPoller` in every API process rather than from the work-unit-deduped reconciliation cycle — otherwise, combined with the zero-init, every replica that never won the work unit would export a confident permanent `0`. It is set only by API processes, each on its own timer: aggregate with `max()`. Deriver pods have no writer for it, so they do not zero-init it and export no series.
+- **Vector-store namespaces are per tenant** (`src/vector_store/tenant_namespace.py`): a namespace is `{prefix}.{doc|msg}.{hash(workspace[, observer, observed])}` and the hash carries no tenant, so the prefix is the only thing separating one tenant's vectors from another's — and `workspace.name` is unique only *within* a tenant, so two tenants on the SDK-default `"default"` workspace would otherwise share a namespace. `get_vector_namespace` is therefore **async** and resolves the prefix per call: `settings.VECTOR_STORE.NAMESPACE` when `MULTI_TENANT` is off (byte-identical to pre-tenancy output, and this beats an explicit `prefix=`), otherwise the bound tenant's `vector_correlation_id`, memoized per process. **The control plane is expected to set `vector_correlation_id` for every tenant it registers; nothing in this repo enforces that, so it is a precondition of turning the flag on rather than a guarantee.** Two consequences worth knowing before touching the vector store:
+  - **It fails closed and never falls back to `tenant_id`.** A tenant registered without a `vector_correlation_id` raises `VectorNamespaceUnresolved` rather than getting a fresh namespace, because a fresh namespace silently orphans whatever that tenant already had — the symptom would be an empty search, not an error. That exception is deliberately **not** a `VectorStoreError`: several callers catch `VectorStoreError` to mean "the backend is briefly unavailable, retry later", which would absorb a permanent provisioning failure as a transient one. A failed *read* of the key is still a `VectorStoreError`, because that one really is retryable.
+  - **Cross-tenant paths pass the row's prefix explicitly, and contain the failure per row.** The reconciler and the soft-delete sweep run across all tenants on `service_db` with no ambient tenant, so they call `prefix_for_tenant(row.tenant_id)` and hand the result to `get_vector_namespace(..., prefix=...)`. (Immediate embedding resolves the prefix the same per-row way, but it is *not* a cross-tenant path — its only entrypoints are the message-creation routes, so it runs on `tracked_db` bound to the request's tenant.) Each resolves inside a per-row `try`: one unresolvable tenant must degrade into the existing sync-attempt backoff, never abort a batch its co-tenants are in — an aborted batch rolls back before any attempt counter moves, so the offending row returns to the front of the next batch forever.
+- **Tenant identity in telemetry** (`src/telemetry/tenant.py`): under `MULTI_TENANT` the ambient `tenant_context` (bound per request in `src/security.py`, per work unit in `src/deriver/queue_manager.py`) is read at four chokepoints — the CloudEvents emitter adds a `tenantid` extension attribute to the envelope (`source` still names the instance), the six attribution counters (`messages_created`, `dialectic_calls`, `deriver_queue_items_processed`, `deriver_tokens_processed`, `dialectic_tokens_processed`, `dreamer_tokens_processed`) carry a `tenant_id` label via `TenantScopedCounter`, the Sentry isolation scope gets a `tenant_id` tag at both bind sites, and Langfuse's `user.id` is the tenant. Flag-off every surface is byte-identical to pre-tenancy output: no attribute, `tenant_id=""` (which Prometheus treats as absent, so zero-init and dashboards are unchanged), no tag, `user.id` = namespace. A flag-on emit with no tenant bound increments `telemetry_events_untenanted{type}` (reconciliation events exempt, they are tenant-less by construction) — non-zero means an emit site runs outside its bind scope. A cross-tenant path that makes a billable call binds that call's tenant instead of joining the exempt list: the reconciler groups its re-embeds by tenant and binds each group. Nothing threads a tenant through event classes or emit sites; do not add one.
+- **Per-tenant fairness metrics** (`DERIVER_TENANT_FAIRNESS_METRICS`, default off, also needs `METRICS_ENABLED`): `deriver_claims_total{tenant_id}` and the `deriver_claim_wait_seconds{tenant_id}` histogram (claim time − the unit's `oldest_created_at`) are recorded at the claim, for the units `claim_work_units` actually took; `deriver_inflight_units{tenant_id}` is rebuilt on the backlog-metrics poll from live `active_queue_sessions` (every API replica reports it: `max()`, never `sum()`). The claim runs on the service session with no tenant bound, so these take `tenant_id` from the work-unit key, not from `TenantScopedCounter`. Flag off: no series and no extra query.
+
+### Project Structure
+
+```
+src/
+├── main.py              # FastAPI app: middleware, routers, lifespan, exception handlers
+├── models.py            # SQLAlchemy ORM models (Workspace/Peer/Session/Message/
+│                        #   MessageEmbedding/Collection/Document/QueueItem/
+│                        #   QueueItemBatch/...)
+├── config.py            # Pydantic-settings configuration (very large; see README)
+├── db.py                # Engine + session/context management (request_context var)
+├── dependencies.py      # FastAPI DI (tracked_db, etc.)
+├── exceptions.py        # Custom exception types (HonchoException + subclasses)
+├── security.py          # JWT authentication
+├── embedding_client.py  # Embedding provider client (configurable dimensions
+│                        #   via EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE)
+├── schemas/             # Pydantic schemas
+│   ├── api.py            # Public API request/response schemas
+│   ├── configuration.py  # Per-resource configuration schemas
+│   └── internal.py       # Internal-only schemas (queue payloads, etc.)
+├── crud/                # Per-resource DB operations
+│   ├── collection.py, deriver.py, document.py, message.py
+│   ├── peer.py, peer_card.py, representation.py  (RepresentationManager)
+│   ├── session.py, tenant.py, webhook.py, workspace.py
+├── routers/             # FastAPI route handlers (all under /v3)
+│   ├── workspaces.py, peers.py (dialectic /chat lives here), sessions.py
+│   ├── messages.py, conclusions.py, keys.py, tenants.py, webhooks.py
+├── dialectic/           # Dialectic agent — runs inline per chat request
+│   ├── chat.py           # agentic_chat() / agentic_chat_stream()
+│   ├── core.py           # DialecticAgent (the tool-loop driver)
+│   └── prompts.py
+├── deriver/             # Background queue consumer (separate process)
+│   ├── __main__.py       # `python -m src.deriver` entry point
+│   ├── queue_manager.py  # QueueManager + main() loop
+│   ├── consumer.py       # process_item dispatcher (representation / deletion / reconciler)
+│   ├── deriver.py        # "minimal deriver" — single-LLM-call batch processor
+│   ├── enqueue.py        # API → queue producer
+│   └── prompts.py
+├── dreamer/             # Memory consolidation (runs off the queue)
+│   ├── orchestrator.py   # run_dream() / process_dream()
+│   ├── specialists.py    # DeductionSpecialist + InductionSpecialist
+│   ├── dream_scheduler.py
+│   ├── surprisal.py      # Surprisal-based conclusion prioritization
+│   └── trees/            # Reasoning-tree primitives
+├── reconciler/          # In-process scheduler hosted by the deriver worker
+│   ├── scheduler.py      # ReconcilerScheduler (started from queue_manager.py)
+│   ├── sync_vectors.py   # Embeds MessageEmbedding rows with sync_state='pending'
+│   └── queue_cleanup.py  # Removes stale queue items
+├── llm/                 # Provider-agnostic LLM client subsystem
+│   ├── api.py, backend.py, executor.py, runtime.py, registry.py
+│   ├── caching.py, structured_output.py, tool_loop.py, conversation.py
+│   ├── messages.py, profiles.py, request_builder.py, credentials.py, types.py
+│   ├── codecs/           # anthropic.py, gemini.py, openai.py (typed history ↔ wire)
+│   └── backends/         # anthropic.py, gemini.py, openai.py
+├── cache/               # Redis cache abstraction (cashews-backed)
+│   └── client.py
+├── vector_store/        # Optional external vector stores (pgvector is default,
+│   │                    #   implemented via MessageEmbedding/Document in models+crud)
+│   ├── lancedb.py
+│   ├── tenant_namespace.py  # Per-tenant namespace prefix (MULTI_TENANT)
+│   └── turbopuffer.py
+├── telemetry/           # Observability
+│   ├── emitter.py        # CloudEvents emitter
+│   ├── logging.py        # Logging helpers + route-template extraction
+│   ├── client_context.py, metrics_collector.py, reasoning_traces.py, sentry.py, tenant.py
+│   ├── events/           # Event type definitions
+│   └── prometheus/       # Prometheus metric definitions
+├── utils/               # Cross-cutting utilities
+│   ├── agent_tools.py    # Tool definitions + per-agent tool lists
+│   ├── summarizer.py     # Two-tier session summarizer
+│   ├── representation.py # Representation formatting (distinct from crud/representation.py)
+│   ├── search.py, filter.py, formatting.py
+│   ├── tokens.py         # tiktoken-based counting
+│   ├── pagination.py     # List pagination: opt-in cursor mode + the cached offset shim
+│   ├── work_unit.py, queue_payload.py
+│   ├── config_helpers.py, json_parser.py, files.py
+│   └── types.py
+└── webhooks/            # Webhook delivery
+    ├── events.py
+    └── webhook_delivery.py
+```
+
+- Tests in pytest with fixtures in tests/conftest.py; subdirs mirror src/ (`tests/deriver/`, `tests/dialectic/`, etc.) plus `tests/bench/` (perf benchmarks), `tests/integration/`, `tests/live_llm/` (gated by `--live-llm`), and `tests/unified/` (the unified runner).
+- The suite is hermetic: non-loopback sockets are blocked (pytest-socket) and provider keys are placeholders, except under `--live-llm`. Fake LLM calls at the import site the code under test uses.
+- A test that reproduces a known, still-open bug is marked `pytest.mark.xfail(strict=True, reason="... (issue N)")`. Once the bug is fixed the test passes, strict mode turns that into a failure, and the fix removes the marker.
+- Use environment variables via python-dotenv (.env). Config precedence: env > .env > config.toml > defaults.
+
+### Database Design
+
+- All tables use text IDs (nanoid format) as primary keys, except service tables with no FK/RLS surface: `queue.id` is an integer identity (see the locking section) and `queue_item_batches.work_unit_key` is the unit's own derived key
+- Composite foreign keys for multi-tenant relationships
+- Feature flags on workspace, peer, and session levels
+- Token counting on messages for usage tracking
+- JSONB metadata fields for extensibility
+- HNSW indexes for vector similarity search
+- **Index a large or partitioned table with `migrations.utils.create_index_online` / `drop_index_online`**, not a hand-rolled `CREATE INDEX CONCURRENTLY`. They build concurrently (on a partitioned table: `ON ONLY` the parent, each partition concurrently, then `ATTACH`), are safe to rerun after a stopped build, and keep `src/models.py`'s `Index()` as the declaration to match by hand.
+- **A `Select` that feeds a list endpoint MUST have a total ORDER BY ending in a unique column** (e.g. `created_at, id`). `paginate_offset_or_cursor` (`src/utils/pagination.py`) seeks by the sort key in both cursor mode and the offset shim; without a unique tail, rows that share a sort key are skipped or repeated across pages.
+- **A query on a partitioned table (`models.TenantPartitioned`) needs a bound `tenant_id` predicate.** RLS compares `tenant_id` to `current_setting('app.tenant')`, which Postgres prunes with only at executor startup, so without a bound value the planner locks every partition. Under `MULTI_TENANT` the `do_orm_execute` hook `models._add_tenant_predicate` adds one to ORM statements that name the model in the column list, `select_from` or a join. Where the hook can't see the model (a Core `Table` query such as `session_peers_table`, a model only in a WHERE clause as in `exists().where(...)` or `select(func.count()).where(...)`, `text()`), filter on `tenant_id == scoped_tenant_id()` yourself. Service sessions (`Session.info[db.CROSS_TENANT]`) are exempt. Add a new hot statement to `_CASES` in `tests/integration/test_tenant_partition_pruning.py`, which asserts its lock count does not grow with the partition count.
+
+### Key Architectural Decisions
+
+1. **Peer Paradigm**: humans and AI agents are unified as "Peers"; many-to-many with Sessions. Internal vector storage (Collections/Documents) is keyed by `(observer, observed)` peer pairs — the same mechanism powers self-representation (`observer == observed`) and cross-peer modeling.
+2. **Multi-Peer Sessions**: Sessions can have multiple participants with different observation settings.
+3. **API server / worker split**: API enqueues, deriver worker process consumes. Never block HTTP on LLM work. The Reconciler runs as an in-process scheduler inside the deriver, handling async embedding sync and queue cleanup.
+4. **"Minimal" deriver**: memory formation is a single structured-output LLM call per batch, not an agentic tool loop. Predictable cost, lower latency. The Dialectic is the one true tool-using agent.
+5. **Provider-agnostic LLM layer** (`src/llm/`): all model calls go through `honcho_llm_call()`. Backends (`anthropic`, `gemini`, `openai`) sit behind a registry; per-agent `MODEL_CONFIG` with fallback chains is resolved at call time.
+6. **Dialectic reasoning tiers**: 5 levels (`minimal` → `max`); each level has its own model config and tool set (`minimal` uses a reduced toolset).
+7. **Hybrid search**: Postgres FTS (GIN index on `(tenant_id, workspace_name, to_tsvector('english', content))`, OR'd with a `content ILIKE` fallback backed by a `pg_trgm` GIN index on `(tenant_id, workspace_name, content)`; `btree_gin` lets both lead with the scalar columns so the bitmap is narrowed to the workspace before the heap is read, and without pg_trgm the trigram index is skipped and the ILIKE scans) + vector similarity (HNSW on `MessageEmbedding.embedding`). `MessageEmbedding` is a separate table from `Message` with its own `sync_state` so embedding is decoupled from message creation.
+8. **Pluggable external vector stores**: defaults to pgvector inline; can swap to turbopuffer or lancedb (`VECTOR_STORE_*` config; `src/vector_store/`).
+9. **Composite-FK multi-tenancy**: `workspace_name` participates in nearly every composite FK. Cross-workspace data leakage is structurally impossible at the schema level.
+10. **Scoped Authentication**: JWTs can be scoped to tenant, workspace, peer, or session level. Under `MULTI_TENANT`, every JWT must carry a tenant claim (`tn`), checked before any admin/workspace/peer/session scope logic — an admin token is admin only within its own tenant. The tenant registry itself (creating/updating/deleting tenants) sits above this scoping and is authenticated separately by a service secret rather than a JWT, since a JWT cannot carry a claim for a tenant that does not exist yet.
+11. **Batch Operations**: Bulk message creation up to 100 messages per request.
+12. **Session History**: Two-tier summarization — short every `SUMMARY_MESSAGES_PER_SHORT_SUMMARY` (default 20), long every `SUMMARY_MESSAGES_PER_LONG_SUMMARY` (default 60).
+
+### Error Handling
+
+- Custom exceptions defined in src/exceptions.py
+- Use specific exception types (ResourceNotFoundException, ValidationException, etc.)
+- Proper logging with context instead of print statements
+- Global exception handlers defined in main.py
+- See docs/contributing/error-handling.mdx for details
+
+### Notes
+
+- Always use `uv run` or `uv` to prefix any commands related to python to ensure you use the virtual environment

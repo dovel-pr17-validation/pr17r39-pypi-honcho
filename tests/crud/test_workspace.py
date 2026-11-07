@@ -1,0 +1,945 @@
+import pytest
+from nanoid import generate as generate_nanoid
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src import crud, models, schemas
+from src.exceptions import ConflictException, ResourceNotFoundException
+from src.vector_store import VectorQueryResult, VectorRecord, VectorStore
+
+
+class _RecordingVectorStore(VectorStore):
+    """A real VectorStore -- get_vector_namespace runs unmodified -- that only
+    records the namespaces passed to delete_namespace, for pinning deletion scope."""
+
+    def __init__(self) -> None:
+        self.deleted_namespaces: list[str] = []
+
+    async def upsert_many(self, namespace: str, vectors: list[VectorRecord]) -> None:
+        return None
+
+    async def query(
+        self,
+        namespace: str,
+        embedding: list[float],
+        *,
+        top_k: int = 10,
+        filters: dict[str, object] | None = None,
+        max_distance: float | None = None,
+        include_attributes: bool | list[str] = True,
+    ) -> list[VectorQueryResult]:
+        return []
+
+    async def delete_many(self, namespace: str, ids: list[str]) -> None:
+        return None
+
+    async def delete_namespace(self, namespace: str) -> None:
+        self.deleted_namespaces.append(namespace)
+
+    async def close(self) -> None:
+        return None
+
+    async def probe_namespace_dim(self, namespace: str) -> int | None:
+        return None
+
+
+class TestWorkspaceCRUD:
+    """Test suite for workspace CRUD operations"""
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_not_found(self, db_session: AsyncSession):
+        """Test delete_workspace with non-existent workspace raises ResourceNotFoundException"""
+        with pytest.raises(ResourceNotFoundException):
+            await crud.delete_workspace(db_session, "nonexistent_workspace")
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_cascade_peers(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that deleting a workspace cascades to delete peers"""
+        test_workspace, _test_peer = sample_data
+
+        # Create additional peer
+        peer2 = models.Peer(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add(peer2)
+        await db_session.flush()
+
+        # Verify peers exist
+        stmt = select(models.Peer).where(
+            models.Peer.workspace_name == test_workspace.name
+        )
+        result = await db_session.execute(stmt)
+        peers = result.scalars().all()
+        assert len(peers) == 2
+
+        # Delete workspace
+        await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify peers are deleted
+        result = await db_session.execute(stmt)
+        peers = result.scalars().all()
+        assert len(peers) == 0
+
+    @pytest.mark.asyncio
+    async def test_check_no_active_sessions_raises(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that check_no_active_sessions raises ConflictException when active sessions exist"""
+        test_workspace, _test_peer = sample_data
+
+        # Create sessions
+        session1 = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        session2 = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add_all([session1, session2])
+        await db_session.flush()
+
+        # check_no_active_sessions should raise ConflictException
+        with pytest.raises(ConflictException, match="active session"):
+            await crud.check_no_active_sessions(db_session, test_workspace.name)
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_succeeds_with_active_sessions(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that delete_workspace cascade-deletes active sessions (no guard in crud)"""
+        test_workspace, _test_peer = sample_data
+
+        # Create active sessions
+        session1 = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        session2 = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add_all([session1, session2])
+        await db_session.flush()
+
+        # crud.delete_workspace should succeed — the guard lives in the router
+        result = await crud.delete_workspace(db_session, test_workspace.name)
+        assert result.workspace.name == test_workspace.name
+        assert result.sessions_deleted == 2
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_cascade_messages(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that deleting a workspace cascades to delete messages"""
+        test_workspace, test_peer = sample_data
+
+        # Create session
+        session = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add(session)
+        await db_session.flush()
+
+        # Create messages
+        message1 = models.Message(
+            content="Test message 1",
+            workspace_name=test_workspace.name,
+            session_name=session.name,
+            peer_name=test_peer.name,
+            seq_in_session=1,
+        )
+        message2 = models.Message(
+            content="Test message 2",
+            workspace_name=test_workspace.name,
+            session_name=session.name,
+            peer_name=test_peer.name,
+            seq_in_session=2,
+        )
+        db_session.add_all([message1, message2])
+        await db_session.flush()
+
+        # Verify messages exist
+        stmt = select(models.Message).where(
+            models.Message.workspace_name == test_workspace.name
+        )
+        result = await db_session.execute(stmt)
+        messages = result.scalars().all()
+        assert len(messages) == 2
+
+        # Mark session inactive so workspace deletion is allowed
+        session.is_active = False
+        await db_session.flush()
+
+        # Delete workspace
+        await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify messages are deleted
+        result = await db_session.execute(stmt)
+        messages = result.scalars().all()
+        assert len(messages) == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_cascade_collections(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that deleting a workspace cascades to delete collections"""
+        test_workspace, test_peer = sample_data
+
+        # Create collection
+        collection = models.Collection(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer.name,
+        )
+        db_session.add(collection)
+        await db_session.flush()
+
+        # Verify collection exists
+        stmt = select(models.Collection).where(
+            models.Collection.workspace_name == test_workspace.name
+        )
+        result = await db_session.execute(stmt)
+        collections = result.scalars().all()
+        assert len(collections) == 1
+
+        # Delete workspace
+        await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify collection is deleted
+        result = await db_session.execute(stmt)
+        collections = result.scalars().all()
+        assert len(collections) == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_cascade_documents(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that deleting a workspace cascades to delete documents"""
+        test_workspace, test_peer = sample_data
+
+        # Create collection
+        collection = models.Collection(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer.name,
+        )
+        db_session.add(collection)
+        await db_session.flush()
+
+        # Create session for document
+        session = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add(session)
+        await db_session.flush()
+
+        # Create document
+        document = models.Document(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer.name,
+            session_name=session.name,
+            content="Test document content",
+        )
+        db_session.add(document)
+        await db_session.flush()
+
+        # Verify document exists
+        stmt = select(models.Document).where(
+            models.Document.workspace_name == test_workspace.name
+        )
+        result = await db_session.execute(stmt)
+        documents = result.scalars().all()
+        assert len(documents) == 1
+
+        # Mark session inactive so workspace deletion is allowed
+        session.is_active = False
+        await db_session.flush()
+
+        # Delete workspace
+        await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify document is deleted
+        result = await db_session.execute(stmt)
+        documents = result.scalars().all()
+        assert len(documents) == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_cascade_session_peers(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that deleting a workspace cascades to delete session_peers associations"""
+        test_workspace, test_peer = sample_data
+
+        # Create session
+        session = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add(session)
+        await db_session.flush()
+
+        # Add peer to session
+        from src.models import session_peers_table
+
+        stmt = session_peers_table.insert().values(
+            workspace_name=test_workspace.name,
+            session_name=session.name,
+            peer_name=test_peer.name,
+        )
+        await db_session.execute(stmt)
+        await db_session.flush()
+
+        # Verify session_peer association exists
+        stmt = select(session_peers_table).where(
+            session_peers_table.c.workspace_name == test_workspace.name
+        )
+        result = await db_session.execute(stmt)
+        session_peers = result.all()
+        assert len(session_peers) == 1
+
+        # Mark session inactive so workspace deletion is allowed
+        session.is_active = False
+        await db_session.flush()
+
+        # Delete workspace
+        await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify session_peer association is deleted
+        result = await db_session.execute(stmt)
+        session_peers = result.all()
+        assert len(session_peers) == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_cascade_webhooks(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that deleting a workspace cascades to delete webhook endpoints"""
+        test_workspace, _test_peer = sample_data
+
+        # Create webhook endpoint
+        webhook = models.WebhookEndpoint(
+            workspace_name=test_workspace.name,
+            url="https://example.com/webhook",
+        )
+        db_session.add(webhook)
+        await db_session.flush()
+
+        # Verify webhook exists
+        stmt = select(models.WebhookEndpoint).where(
+            models.WebhookEndpoint.workspace_name == test_workspace.name
+        )
+        result = await db_session.execute(stmt)
+        webhooks = result.scalars().all()
+        assert len(webhooks) == 1
+
+        # Delete workspace
+        await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify webhook is deleted
+        result = await db_session.execute(stmt)
+        webhooks = result.scalars().all()
+        assert len(webhooks) == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_cascade_queue_items(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that deleting a workspace cascades to delete queue items"""
+        test_workspace, test_peer = sample_data
+
+        # Create session
+        session = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add(session)
+        await db_session.flush()
+
+        # Create queue item with work_unit_key containing workspace name
+        # Format: {task_type}:{workspace_name}:{...}
+        queue_item = models.QueueItem(
+            work_unit_key=f"representation:{test_workspace.name}:{session.name}:{test_peer.name}:{test_peer.name}",
+            task_type="representation",
+            payload={"test": "data"},
+            workspace_name=test_workspace.name,
+        )
+        db_session.add(queue_item)
+        await db_session.flush()
+
+        # Verify queue item exists
+        stmt = select(models.QueueItem)
+        result = await db_session.execute(stmt)
+        queue_items = result.scalars().all()
+        assert len(queue_items) == 1
+
+        # Mark session inactive so workspace deletion is allowed
+        session.is_active = False
+        await db_session.flush()
+
+        # Delete workspace
+        await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify queue item is deleted
+        result = await db_session.execute(stmt)
+        queue_items = result.scalars().all()
+        assert len(queue_items) == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_cascade_active_queue_sessions(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that deleting a workspace cascades to delete active queue sessions"""
+        test_workspace, test_peer = sample_data
+
+        # Create session
+        session = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add(session)
+        await db_session.flush()
+
+        # Create active queue session with work_unit_key containing workspace name
+        # Format: {task_type}:{workspace_name}:{...}
+        active_queue = models.ActiveQueueSession(
+            work_unit_key=f"representation:{test_workspace.name}:{session.name}:{test_peer.name}:{test_peer.name}",
+        )
+        db_session.add(active_queue)
+        await db_session.flush()
+
+        # Verify active queue session exists
+        stmt = select(models.ActiveQueueSession)
+        result = await db_session.execute(stmt)
+        active_queues = result.scalars().all()
+        assert len(active_queues) == 1
+
+        # Mark session inactive so workspace deletion is allowed
+        session.is_active = False
+        await db_session.flush()
+
+        # Delete workspace
+        await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify active queue session is deleted
+        result = await db_session.execute(stmt)
+        active_queues = result.scalars().all()
+        assert len(active_queues) == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_returns_deleted_workspace(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that delete_workspace returns WorkspaceDeletionResult with cascade counts"""
+        test_workspace, _test_peer = sample_data
+
+        # Store workspace details before deletion
+        workspace_name = test_workspace.name
+
+        # Delete workspace
+        result = await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify returned result is WorkspaceDeletionResult with correct workspace
+        assert isinstance(result, crud.WorkspaceDeletionResult)
+        assert result.workspace.name == workspace_name
+        assert isinstance(result.workspace, schemas.Workspace)
+
+        # Verify cascade counts are present (should have 1 peer from sample_data)
+        assert result.peers_deleted == 1
+        assert result.sessions_deleted >= 0
+        assert result.messages_deleted >= 0
+        assert result.conclusions_deleted >= 0
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_complex_cascade(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test deleting a workspace with multiple related resources of different types"""
+        test_workspace, test_peer = sample_data
+
+        # Create additional peer
+        peer2 = models.Peer(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add(peer2)
+
+        # Create sessions
+        session1 = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        session2 = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add_all([session1, session2])
+        await db_session.flush()
+
+        # Create messages
+        message1 = models.Message(
+            content="Test message 1",
+            workspace_name=test_workspace.name,
+            session_name=session1.name,
+            peer_name=test_peer.name,
+            seq_in_session=1,
+        )
+        message2 = models.Message(
+            content="Test message 2",
+            workspace_name=test_workspace.name,
+            session_name=session2.name,
+            peer_name=peer2.name,
+            seq_in_session=1,
+        )
+        db_session.add_all([message1, message2])
+
+        # Create collection and document
+        collection = models.Collection(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=peer2.name,
+        )
+        db_session.add(collection)
+        await db_session.flush()
+
+        document = models.Document(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=peer2.name,
+            session_name=session1.name,
+            content="Test document",
+        )
+        db_session.add(document)
+
+        # Create webhook
+        webhook = models.WebhookEndpoint(
+            workspace_name=test_workspace.name,
+            url="https://example.com/webhook",
+        )
+        db_session.add(webhook)
+        await db_session.flush()
+
+        # Count all resources before deletion
+        peer_stmt = select(models.Peer).where(
+            models.Peer.workspace_name == test_workspace.name
+        )
+        session_stmt = select(models.Session).where(
+            models.Session.workspace_name == test_workspace.name
+        )
+        message_stmt = select(models.Message).where(
+            models.Message.workspace_name == test_workspace.name
+        )
+        collection_stmt = select(models.Collection).where(
+            models.Collection.workspace_name == test_workspace.name
+        )
+        document_stmt = select(models.Document).where(
+            models.Document.workspace_name == test_workspace.name
+        )
+        webhook_stmt = select(models.WebhookEndpoint).where(
+            models.WebhookEndpoint.workspace_name == test_workspace.name
+        )
+
+        # Verify all resources exist
+        assert len((await db_session.execute(peer_stmt)).scalars().all()) == 2
+        assert len((await db_session.execute(session_stmt)).scalars().all()) == 2
+        assert len((await db_session.execute(message_stmt)).scalars().all()) == 2
+        assert len((await db_session.execute(collection_stmt)).scalars().all()) == 1
+        assert len((await db_session.execute(document_stmt)).scalars().all()) == 1
+        assert len((await db_session.execute(webhook_stmt)).scalars().all()) == 1
+
+        # Mark sessions inactive so workspace deletion is allowed
+        session1.is_active = False
+        session2.is_active = False
+        await db_session.flush()
+
+        # Delete workspace
+        await crud.delete_workspace(db_session, test_workspace.name)
+
+        # Verify all related resources are deleted
+        assert len((await db_session.execute(peer_stmt)).scalars().all()) == 0
+        assert len((await db_session.execute(session_stmt)).scalars().all()) == 0
+        assert len((await db_session.execute(message_stmt)).scalars().all()) == 0
+        assert len((await db_session.execute(collection_stmt)).scalars().all()) == 0
+        assert len((await db_session.execute(document_stmt)).scalars().all()) == 0
+        assert len((await db_session.execute(webhook_stmt)).scalars().all()) == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_allows_inactive_sessions(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that workspace deletion succeeds when all sessions are inactive"""
+        test_workspace, _test_peer = sample_data
+
+        # Create sessions and mark them inactive
+        session1 = models.Session(
+            name=str(generate_nanoid()),
+            workspace_name=test_workspace.name,
+            is_active=False,
+        )
+        session2 = models.Session(
+            name=str(generate_nanoid()),
+            workspace_name=test_workspace.name,
+            is_active=False,
+        )
+        db_session.add_all([session1, session2])
+        await db_session.flush()
+
+        # Delete workspace should succeed
+        result = await crud.delete_workspace(db_session, test_workspace.name)
+        assert result.workspace.name == test_workspace.name
+
+        # Verify sessions are cleaned up
+        stmt = select(models.Session).where(
+            models.Session.workspace_name == test_workspace.name
+        )
+        remaining = await db_session.execute(stmt)
+        assert len(remaining.scalars().all()) == 0
+
+    @pytest.mark.asyncio
+    async def test_check_no_active_sessions_passes_after_deletion(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Test that check_no_active_sessions passes after sessions are deleted"""
+        test_workspace, _test_peer = sample_data
+
+        # Create active sessions
+        session1 = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        session2 = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add_all([session1, session2])
+        await db_session.flush()
+
+        # check_no_active_sessions should fail with active sessions
+        with pytest.raises(ConflictException):
+            await crud.check_no_active_sessions(db_session, test_workspace.name)
+
+        # Delete the sessions
+        await db_session.delete(session1)
+        await db_session.delete(session2)
+        await db_session.flush()
+
+        # Now check_no_active_sessions should pass (no exception)
+        await crud.check_no_active_sessions(db_session, test_workspace.name)
+
+        # And workspace deletion should succeed
+        result = await crud.delete_workspace(db_session, test_workspace.name)
+        assert result.workspace.name == test_workspace.name
+
+
+class TestDeleteWorkspaceTenantScopedQueueCleanup:
+    """delete_workspace's ActiveQueueSession cleanup must be tenant-aware.
+
+    Under MULTI_TENANT, tenant-scoped work-unit keys are prefixed
+    {tenant_id}:{task_type}:{workspace_name}:... — a tenant-blind position-2
+    match deletes nothing of the tenant's own scoped claims while hitting other
+    tenants' un-prefixed reconciler keys for a same-named workspace.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cleanup_scoped_to_deleting_tenant(
+        self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ):
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        from src.config import settings
+        from src.db import tenant_context
+
+        workspace_name = str(generate_nanoid())
+        for tenant_id in ("tenant-a", "tenant-b"):
+            await db_session.execute(
+                pg_insert(models.Tenant)
+                .values(tenant_id=tenant_id, tier="shared")
+                .on_conflict_do_nothing()
+            )
+        db_session.add(models.Workspace(name=workspace_name, tenant_id="tenant-a"))
+        db_session.add_all(
+            [
+                models.ActiveQueueSession(
+                    work_unit_key=f"tenant-a:dream:{workspace_name}:alice:alice",
+                    tenant_id="tenant-a",
+                ),
+                models.ActiveQueueSession(
+                    work_unit_key=f"tenant-b:dream:{workspace_name}:alice:alice",
+                    tenant_id="tenant-b",
+                ),
+                # Reconciler claims are never tenant-prefixed; they belong to the
+                # stale-work cleanup, and a workspace delete must not touch them.
+                models.ActiveQueueSession(
+                    work_unit_key=f"reconciler:{workspace_name}",
+                    tenant_id=None,
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        monkeypatch.setattr(settings, "MULTI_TENANT", True)
+        token = tenant_context.set("tenant-a")
+        try:
+            await crud.delete_workspace(db_session, workspace_name)
+        finally:
+            tenant_context.reset(token)
+
+        surviving = (
+            (await db_session.execute(select(models.ActiveQueueSession.work_unit_key)))
+            .scalars()
+            .all()
+        )
+        assert f"tenant-a:dream:{workspace_name}:alice:alice" not in surviving
+        assert f"tenant-b:dream:{workspace_name}:alice:alice" in surviving
+        assert f"reconciler:{workspace_name}" in surviving
+
+    @pytest.mark.asyncio
+    async def test_flag_on_without_tenant_fails_closed(
+        self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ):
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        from src.config import settings
+
+        workspace_name = str(generate_nanoid())
+        await db_session.execute(
+            pg_insert(models.Tenant)
+            .values(tenant_id="tenant-a", tier="shared")
+            .on_conflict_do_nothing()
+        )
+        db_session.add(models.Workspace(name=workspace_name, tenant_id="tenant-a"))
+        await db_session.commit()
+
+        monkeypatch.setattr(settings, "MULTI_TENANT", True)
+        with pytest.raises(ValueError, match="without a tenant when MULTI_TENANT"):
+            await crud.delete_workspace(db_session, workspace_name)
+
+
+class TestDeleteWorkspaceQueueItemTenantScopedCleanup:
+    """delete_workspace's QueueItem cleanup must be tenant-aware too (B5).
+
+    QueueItem.workspace_name is only unique per tenant (every tenant has a
+    "default" workspace) and queue is deliberately not under RLS (see
+    _RLS_REQUIRED_TABLES), so a tenant-blind match on workspace_name alone
+    deletes another tenant's same-named workspace's queue rows. See
+    queue_item_tenant_match in src/crud/deriver.py.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queue_items_scoped_to_deleting_tenant(
+        self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        from src.config import settings
+        from src.db import tenant_context
+
+        workspace_name = str(generate_nanoid())
+        for tenant_id in ("tenant-a", "tenant-b"):
+            await db_session.execute(
+                pg_insert(models.Tenant)
+                .values(tenant_id=tenant_id, tier="shared")
+                .on_conflict_do_nothing()
+            )
+        # Only tenant-a gets an actual Workspace row: workspaces are
+        # partitioned (tenant_id, id) with a (tenant_id, name) unique
+        # constraint, not a global one, so two tenants legitimately have a
+        # workspace named the same; the test db_session connects as the
+        # Postgres superuser, which always bypasses RLS, so a second
+        # same-named Workspace row here would make delete_workspace's own
+        # by-name lookup ambiguous for reasons unrelated to this fix. The
+        # real bug is entirely about the QueueItem.workspace_name string
+        # colliding across tenants, which this reproduces without needing a
+        # second Workspace row: tenant-b's QueueItem carries the identical
+        # workspace_name string a real tenant-b writer would use for its own
+        # "default" workspace.
+        db_session.add(models.Workspace(name=workspace_name, tenant_id="tenant-a"))
+        db_session.add_all(
+            [
+                models.QueueItem(
+                    tenant_id="tenant-a",
+                    workspace_name=workspace_name,
+                    work_unit_key=(
+                        f"tenant-a:representation:{workspace_name}:alice:alice"
+                    ),
+                    task_type="representation",
+                    payload={},
+                ),
+                models.QueueItem(
+                    tenant_id="tenant-b",
+                    workspace_name=workspace_name,
+                    work_unit_key=(
+                        f"tenant-b:representation:{workspace_name}:alice:alice"
+                    ),
+                    task_type="representation",
+                    payload={},
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        monkeypatch.setattr(settings, "MULTI_TENANT", True)
+        token = tenant_context.set("tenant-a")
+        try:
+            await crud.delete_workspace(db_session, workspace_name)
+        finally:
+            tenant_context.reset(token)
+
+        surviving = (
+            (await db_session.execute(select(models.QueueItem.tenant_id)))
+            .scalars()
+            .all()
+        )
+        assert "tenant-a" not in surviving
+        assert surviving.count("tenant-b") == 1
+
+    def test_flag_off_returns_none_and_adds_no_predicate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Flag-off, queue_item_tenant_match must return None so callers add zero
+        predicate — confirmed at the compiled-SQL level, not just the Python
+        return value, so a caller that drops the `if match is not None` guard
+        can't silently reintroduce a tenant_id clause into the flag-off
+        single-tenant SQL (the OSS byte-identity invariant)."""
+        from sqlalchemy import delete
+        from sqlalchemy.dialects import postgresql
+
+        from src.config import settings
+        from src.crud.deriver import queue_item_tenant_match
+
+        monkeypatch.setattr(settings, "MULTI_TENANT", False)
+        assert queue_item_tenant_match() is None
+
+        stmt = delete(models.QueueItem).where(
+            models.QueueItem.workspace_name == "some-workspace"
+        )
+        compiled = str(stmt.compile(dialect=postgresql.dialect()))
+        assert "tenant_id" not in compiled
+
+    def test_flag_on_without_tenant_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.config import settings
+        from src.crud.deriver import queue_item_tenant_match
+
+        monkeypatch.setattr(settings, "MULTI_TENANT", True)
+        with pytest.raises(ValueError, match="without a tenant when MULTI_TENANT"):
+            queue_item_tenant_match()
+
+
+class TestDeleteWorkspaceVectorNamespaceScoping:
+    """delete_workspace's vector-store deletion must be scoped to the deleting tenant.
+
+    A namespace collision is a read leak in both directions, but this side is the one
+    that cannot be undone (delete_namespace has no inverse), so it gets its own pin
+    independent of the namespace-resolution tests.
+    """
+
+    @pytest.mark.asyncio
+    async def test_delete_workspace_targets_only_the_deleting_tenants_namespace(
+        self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ):
+        from unittest.mock import patch
+
+        from src.config import settings
+        from src.db import tenant_context
+
+        monkeypatch.setattr(settings, "MULTI_TENANT", True)
+
+        tenant_a = str(generate_nanoid())
+        tenant_b = str(generate_nanoid())
+        db_session.add_all(
+            [
+                models.Tenant(tenant_id=tenant_a, vector_correlation_id="tenant-a-app"),
+                models.Tenant(tenant_id=tenant_b, vector_correlation_id="tenant-b-app"),
+            ]
+        )
+        workspace_name = str(generate_nanoid())
+        db_session.add(models.Workspace(name=workspace_name, tenant_id=tenant_a))
+        await db_session.commit()
+
+        recording_store = _RecordingVectorStore()
+
+        # The namespace each tenant would resolve to for this same workspace name --
+        # computed independently, before the delete, so the assertion below doesn't
+        # just compare the deletion call against itself.
+        token = tenant_context.set(tenant_a)
+        try:
+            namespace_for_tenant_a = await recording_store.get_vector_namespace(
+                "message", workspace_name
+            )
+        finally:
+            tenant_context.reset(token)
+
+        token = tenant_context.set(tenant_b)
+        try:
+            namespace_if_tenant_b = await recording_store.get_vector_namespace(
+                "message", workspace_name
+            )
+        finally:
+            tenant_context.reset(token)
+
+        assert namespace_for_tenant_a != namespace_if_tenant_b
+
+        token = tenant_context.set(tenant_a)
+        try:
+            with patch(
+                "src.crud.workspace.get_external_vector_store",
+                return_value=recording_store,
+            ):
+                await crud.delete_workspace(db_session, workspace_name)
+        finally:
+            tenant_context.reset(token)
+
+        assert namespace_for_tenant_a in recording_store.deleted_namespaces
+        assert namespace_if_tenant_b not in recording_store.deleted_namespaces
+
+
+class TestWorkspaceCreateRace:
+    @pytest.mark.asyncio
+    async def test_lost_create_race_reads_row_past_the_cache(
+        self, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ):
+        """After a unique violation the row is read from the DB, not the cache.
+
+        The cached lookup can report a miss for a row that exists; the loser of
+        a create race must still get that row back instead of a 409.
+        """
+        from src.crud import workspace as workspace_crud
+
+        name = str(generate_nanoid())
+        await crud.get_or_create_workspace(
+            db_session, schemas.WorkspaceCreate(name=name)
+        )
+        await db_session.commit()
+
+        async def always_miss(_db: AsyncSession, _workspace_name: str):
+            return None
+
+        monkeypatch.setattr(workspace_crud, "_fetch_workspace", always_miss)
+
+        result = await crud.get_or_create_workspace(
+            db_session, schemas.WorkspaceCreate(name=name)
+        )
+
+        assert result.created is False
+        assert result.resource.name == name

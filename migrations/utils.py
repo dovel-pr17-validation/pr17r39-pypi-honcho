@@ -1,0 +1,454 @@
+import logging
+import random
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.exc import DBAPIError
+
+from src.config import settings
+from src.migrate import LOCK_NOT_AVAILABLE
+
+logger = logging.getLogger("alembic")
+
+# The statement_timeout of one concurrent index build (a partition, or a plain table).
+BUILD_TIMEOUT = "60min"
+# In-place retries of one short-lock statement (ON ONLY, ATTACH, a partitioned DROP).
+SHORT_LOCK_ATTEMPTS = 5
+
+
+def get_schema() -> str:
+    return settings.DB.SCHEMA
+
+
+def table_exists(table_name: str, inspector: sa.Inspector | None = None) -> bool:
+    """Check if a table exists in the database."""
+    if inspector is None:
+        inspector = sa.inspect(op.get_bind())
+    schema = get_schema()
+    return inspector.has_table(table_name, schema=schema)
+
+
+def column_exists(
+    table_name: str, column_name: str, inspector: sa.Inspector | None = None
+) -> bool:
+    """Check if a column exists in a table."""
+    if inspector is None:
+        inspector = sa.inspect(op.get_bind())
+    schema = get_schema()
+    existing_columns = [
+        col["name"] for col in inspector.get_columns(table_name, schema=schema)
+    ]
+    return column_name in existing_columns
+
+
+def fk_exists(
+    table_name: str, fk_name: str, inspector: sa.Inspector | None = None
+) -> bool:
+    """Check if a foreign key exists in a table."""
+    if inspector is None:
+        inspector = sa.inspect(op.get_bind())
+    schema = get_schema()
+    foreign_keys = inspector.get_foreign_keys(table_name, schema=schema)
+    return any(fk.get("name") == fk_name for fk in foreign_keys)
+
+
+def index_exists(
+    table_name: str, index_name: str, inspector: sa.Inspector | None = None
+) -> bool:
+    """Check if an index exists in a table."""
+    if inspector is None:
+        inspector = sa.inspect(op.get_bind())
+    schema = get_schema()
+    indexes = inspector.get_indexes(table_name, schema=schema)
+    return any(idx["name"] == index_name for idx in indexes)
+
+
+def constraint_exists(
+    table_name: str,
+    constraint_name: str,
+    type: str,
+    inspector: sa.Inspector | None = None,
+) -> bool:
+    """Check if a constraint exists in a table."""
+    if inspector is None:
+        inspector = sa.inspect(op.get_bind())
+    schema = get_schema()
+    if type == "check":
+        constraints = inspector.get_check_constraints(table_name, schema=schema)
+    elif type == "unique":
+        constraints = inspector.get_unique_constraints(table_name, schema=schema)
+    elif type == "primary":
+        constraint = inspector.get_pk_constraint(table_name, schema=schema)
+        return constraint["name"] == constraint_name
+    elif type == "foreignkey":
+        constraints = inspector.get_foreign_keys(table_name, schema=schema)
+    else:
+        raise ValueError(f"Invalid constraint type: {type}")
+    return any(constraint["name"] == constraint_name for constraint in constraints)
+
+
+def make_column_non_nullable_safe(table_name: str, column_name: str) -> None:
+    """
+    Make a column non-nullable using a non-blocking approach to minimize lock duration.
+
+    WARNING: Only use this if you can guarantee that:
+        1. No NULL values currently exist in the column
+        2. The application code is already writing non-NULL values to this column or
+        3. The column has never accepted NULLs in practice
+
+    This uses a 4-step process to avoid long exclusive locks:
+    1. Add CHECK constraint with NOT VALID (instant, no scan)
+    2. Validate the constraint (scans but allows concurrent read/writes to the table)
+    3. Set column NOT NULL (fast since we've validated the constraint)
+    4. Drop the redundant CHECK constraint
+
+    Args:
+        table_name: The name of the table
+        column_name: The name of the column to make non-nullable
+    """
+    schema = get_schema()
+    conn = op.get_bind()
+    constraint_name = f"{table_name}_{column_name}_not_null"
+
+    # Step 1: Check if the column is already non-nullable
+    inspector = sa.inspect(op.get_bind())
+    columns = inspector.get_columns(table_name, schema=schema)
+    column_info = next((col for col in columns if col["name"] == column_name), None)
+    if column_info is None:
+        raise ValueError(f"Column {table_name}.{column_name} does not exist")
+    if not column_info["nullable"]:
+        print(f"Column {table_name}.{column_name} is already non-nullable, skipping...")
+        return
+
+    # Step 2: Add CHECK constraint without validation (instant)
+    # Note: op.create_check_constraint() doesn't support NOT VALID, so use raw SQL
+
+    # Get the identifier preparer for safe quoting
+    dialect = conn.dialect
+    preparer = dialect.identifier_preparer
+
+    quoted_schema = preparer.quote(schema)
+    quoted_table = preparer.quote(table_name)
+    quoted_constraint = preparer.quote(constraint_name)
+    quoted_column = preparer.quote(column_name)
+
+    # Step 2: Add CHECK constraint without validation (instant)
+    # Note: op.create_check_constraint() doesn't support NOT VALID, so use raw SQL
+    if not constraint_exists(table_name, constraint_name, "check"):
+        conn.execute(
+            sa.text(
+                f"""
+                ALTER TABLE {quoted_schema}.{quoted_table}
+                ADD CONSTRAINT {quoted_constraint}
+                CHECK ({quoted_column} IS NOT NULL)
+                NOT VALID
+                """
+            )
+        )
+
+    # Step 3: Validate constraint (scans but allows concurrent operations)
+    conn.execute(
+        sa.text(
+            f"""
+            ALTER TABLE {quoted_schema}.{quoted_table}
+            VALIDATE CONSTRAINT {quoted_constraint}
+            """
+        )
+    )
+
+    # Step 4: Set NOT NULL (fast with validated constraint)
+    op.alter_column(
+        table_name,
+        column_name,
+        nullable=False,
+        schema=schema,
+    )
+
+    # Step 5: Drop the redundant CHECK constraint
+    conn.execute(
+        sa.text(
+            f"""
+          ALTER TABLE {quoted_schema}.{quoted_table}
+          DROP CONSTRAINT {quoted_constraint}
+          """
+        )
+    )
+
+
+def caller_owns_transaction() -> bool:
+    """True when env.py runs inside a transaction the caller opened.
+
+    That is env.py reusing a connection from config.attributes["connection"].
+    Nothing in this repo passes one: src.migrate and the alembic tests let env.py
+    own the transaction.
+    """
+    config = op.get_context().config
+    return config is not None and not config.attributes.get("owns_transaction", True)
+
+
+def index_valid(name: str) -> bool | None:
+    """The index's indisvalid, or None if it doesn't exist."""
+    return op.get_bind().scalar(
+        sa.text(
+            "SELECT i.indisvalid FROM pg_index i"
+            + " JOIN pg_class c ON c.oid = i.indexrelid"
+            + " JOIN pg_namespace n ON n.oid = c.relnamespace"
+            + " WHERE c.relname = :name AND n.nspname = :schema"
+        ),
+        {"name": name, "schema": get_schema()},
+    )
+
+
+def _is_partitioned(table: str) -> bool:
+    return (
+        op.get_bind().scalar(
+            sa.text("SELECT relkind FROM pg_class WHERE oid = to_regclass(:table)"),
+            {"table": f'"{get_schema()}"."{table}"'},
+        )
+        == "p"
+    )
+
+
+def _partitions(table: str) -> list[str]:
+    """The table's leaf partitions in its own schema, excluding any being detached.
+
+    A sub-partitioned child (relkind 'p') can't take CREATE INDEX CONCURRENTLY, and a
+    child in another schema would be addressed wrongly, so both are refused.
+    """
+    rows = op.get_bind().execute(
+        sa.text(
+            "SELECT c.relname, c.relkind, n.nspname FROM pg_inherits h"
+            + " JOIN pg_class c ON c.oid = h.inhrelid"
+            + " JOIN pg_namespace n ON n.oid = c.relnamespace"
+            + " WHERE h.inhparent = to_regclass(:table) AND NOT h.inhdetachpending"
+            + " ORDER BY c.relname"
+        ),
+        {"table": f'"{get_schema()}"."{table}"'},
+    )
+    partitions: list[str] = []
+    for relname, relkind, nspname in rows:
+        if relkind != "r" or nspname != get_schema():
+            raise ValueError(
+                f"partition {nspname}.{relname} of {table} is not a plain table in"
+                + f" schema {get_schema()}; create_index_online can't build it"
+            )
+        partitions.append(relname)
+    return partitions
+
+
+def _attached_partitions(index: str) -> set[str]:
+    """The partitions whose index is attached to the partitioned index."""
+    return set(
+        op.get_bind().scalars(
+            sa.text(
+                "SELECT t.relname FROM pg_inherits h"
+                + " JOIN pg_index i ON i.indexrelid = h.inhrelid"
+                + " JOIN pg_class t ON t.oid = i.indrelid"
+                + " WHERE h.inhparent = to_regclass(:index)"
+            ),
+            {"index": f'"{get_schema()}"."{index}"'},
+        )
+    )
+
+
+def _partition_index_name(index: str, table: str, partition: str) -> str:
+    name = f"{index}_{partition.removeprefix(table + '_')}"
+    if len(name.encode()) > 63:
+        raise ValueError(f"index name {name} is longer than 63 bytes")
+    return name
+
+
+def _execute_short_lock(sql: str, attempts: int = SHORT_LOCK_ATTEMPTS) -> None:
+    """Run one short-lock statement, retrying it in place on lock_timeout.
+
+    In an autocommit block a timed-out statement leaves nothing to roll back, so a
+    retry here costs one statement, not a rerun of the revision under
+    src.migrate.run_with_lock_retry's budget, which the whole upgrade shares.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            op.execute(sql)
+            return
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) != LOCK_NOT_AVAILABLE or (
+                attempt == attempts
+            ):
+                raise
+            delay = random.uniform(0.25, 0.5) * 2 ** (attempt - 1)
+            logger.warning(
+                "lock_timeout on %r (attempt %d/%d), retrying in %.1fs",
+                sql,
+                attempt,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+
+
+@contextmanager
+def build_timeouts(timeout: str = BUILD_TIMEOUT) -> Generator[None]:
+    """No lock_timeout and a long statement_timeout, for one concurrent build.
+
+    A concurrent build waits for every transaction that holds an older snapshot,
+    so the migration's short lock_timeout would fail it. The statement_timeout
+    makes a stuck idle-in-transaction session fail the build instead of hanging it.
+    """
+    connection = op.get_bind()
+    lock_timeout = connection.scalar(sa.text("SHOW lock_timeout"))
+    statement_timeout = connection.scalar(sa.text("SHOW statement_timeout"))
+    connection.execute(sa.text("SET lock_timeout = 0"))
+    connection.execute(sa.text(f"SET statement_timeout = '{timeout}'"))
+    try:
+        yield
+    finally:
+        try:
+            for name, value in (
+                ("lock_timeout", lock_timeout),
+                ("statement_timeout", statement_timeout),
+            ):
+                connection.execute(
+                    sa.text("SELECT set_config(:name, :value, false)"),
+                    {"name": name, "value": value},
+                )
+        except DBAPIError:
+            # ai: a dropped connection can't be restored; let the build's own error surface.
+            if not connection.invalidated:
+                raise
+
+
+def create_index_online(
+    name: str,
+    table: str,
+    columns: str,
+    *,
+    using: str | None = None,
+    include: str | None = None,
+    where: str | None = None,
+) -> None:
+    """Create an index on a plain or a partitioned table, with no long write block.
+
+    `columns`, `include` and `where` are SQL, e.g. columns="tenant_id, created_at DESC";
+    `using` is the access method, e.g. "gin", with operator classes in `columns`.
+
+    A plain table gets CREATE INDEX CONCURRENTLY. Postgres refuses CONCURRENTLY on
+    a partitioned table, so there the steps are: CREATE INDEX ... ON ONLY the
+    parent (instant, INVALID), CREATE INDEX CONCURRENTLY on each partition, and
+    ALTER INDEX ... ATTACH PARTITION for each one. The parent turns valid when the
+    last partition is attached. The concurrent builds run under build_timeouts().
+    The other steps are short but lock: ON ONLY takes SHARE on the parent table
+    (writes wait), and ATTACH takes ACCESS EXCLUSIVE on the partition's new index.
+    They keep the migration's lock_timeout and retry in place on a timeout
+    (_execute_short_lock).
+
+    It is safe to run again: a valid index and an attached partition are kept, and
+    an INVALID index (a build that stopped part-way) is dropped and built again.
+    A hand-run of the same steps is picked up if it uses the same names: `name`
+    for the parent, and _partition_index_name() for each partition (`name` plus
+    the partition's suffix). An unattached partition index under another name is
+    not detected; it is left behind and a second one is built. Don't hand-build
+    while a deploy runs this revision: an in-progress build looks INVALID and is
+    dropped and built again.
+
+    The caller-owned branch (env.py reusing a connection from
+    config.attributes["connection"], in the caller's transaction) is one
+    transactional CREATE INDEX. Nothing in this repo takes it.
+    """
+    schema = get_schema()
+    method = f" USING {using}" if using else ""
+    tail = (f" INCLUDE ({include})" if include else "") + (
+        f" WHERE {where}" if where else ""
+    )
+
+    def create(index: str, target: str, concurrently: bool) -> None:
+        how = "CONCURRENTLY " if concurrently else ""
+        op.execute(
+            f'CREATE INDEX {how}IF NOT EXISTS "{index}" ON {target}{method}'
+            + f" ({columns}){tail}"
+        )
+
+    parent = f'"{schema}"."{table}"'
+    if caller_owns_transaction():
+        if index_valid(name) is False:
+            op.execute(f'DROP INDEX "{schema}"."{name}"')
+        create(name, parent, concurrently=False)
+        return
+
+    if not _is_partitioned(table):
+        with op.get_context().autocommit_block(), build_timeouts():
+            if index_valid(name) is False:
+                op.execute(f'DROP INDEX CONCURRENTLY "{schema}"."{name}"')
+            logger.info(
+                "Building %s on %s concurrently; waits for older transactions, up to %s",
+                name,
+                table,
+                BUILD_TIMEOUT,
+            )
+            create(name, parent, concurrently=True)
+        return
+
+    parent_valid = index_valid(name)
+    if parent_valid:
+        return
+    with op.get_context().autocommit_block():
+        if parent_valid is None:
+            _execute_short_lock(
+                f'CREATE INDEX IF NOT EXISTS "{name}" ON ONLY {parent}{method}'
+                + f" ({columns}){tail}"
+            )
+        attached = _attached_partitions(name)
+        for partition in _partitions(table):
+            if partition in attached:
+                continue
+            child = _partition_index_name(name, table, partition)
+            with build_timeouts():
+                if index_valid(child) is False:
+                    op.execute(f'DROP INDEX CONCURRENTLY "{schema}"."{child}"')
+                logger.info(
+                    "Building %s on %s concurrently; waits for older transactions, up to %s",
+                    child,
+                    partition,
+                    BUILD_TIMEOUT,
+                )
+                create(child, f'"{schema}"."{partition}"', concurrently=True)
+            _execute_short_lock(
+                f'ALTER INDEX "{schema}"."{name}" ATTACH PARTITION "{schema}"."{child}"'
+            )
+        if not index_valid(name):
+            raise RuntimeError(
+                f"{name} is still INVALID after attaching every partition of {table};"
+                + " a partition index attached by hand may be INVALID or differ in definition"
+            )
+
+
+def drop_index_online(name: str, table: str) -> None:
+    """Drop an index that create_index_online made.
+
+    A partitioned index can't be dropped CONCURRENTLY: there it is one DROP INDEX,
+    which takes ACCESS EXCLUSIVE on the table and every partition, and also drops
+    the attached partition indexes. It runs in its own transaction, so one drop
+    never holds its locks while waiting on another table's. Partition indexes that
+    a stopped build left unattached are dropped by name.
+    """
+    schema = get_schema()
+    if caller_owns_transaction():
+        op.execute(f'DROP INDEX IF EXISTS "{schema}"."{name}"')
+        if _is_partitioned(table):
+            for partition in _partitions(table):
+                child = _partition_index_name(name, table, partition)
+                op.execute(f'DROP INDEX IF EXISTS "{schema}"."{child}"')
+        return
+    if _is_partitioned(table):
+        with op.get_context().autocommit_block():
+            _execute_short_lock(f'DROP INDEX IF EXISTS "{schema}"."{name}"')
+            for partition in _partitions(table):
+                child = _partition_index_name(name, table, partition)
+                with build_timeouts():
+                    op.execute(
+                        f'DROP INDEX CONCURRENTLY IF EXISTS "{schema}"."{child}"'
+                    )
+        return
+    with op.get_context().autocommit_block(), build_timeouts():
+        op.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{schema}"."{name}"')
